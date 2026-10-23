@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""backtest/src → backtest/index.html (단일 HTML). 사용: python backtest/src/build.py"""
+"""src → index.html (단일 HTML). 사용: python src/build.py"""
 import os
 D = os.path.dirname(os.path.abspath(__file__))
 r = lambda f: open(os.path.join(D, f), encoding="utf-8").read()

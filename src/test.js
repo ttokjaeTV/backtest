@@ -1,8 +1,8 @@
-// node backtest/src/test.js  (레포 루트에서)
+// node src/test.js  (레포 루트에서) — 데이터는 옆 폴더 ../portfolio-sheet-data/data
 const fs = require('fs');
 const path = require('path');
 const BT = require('./engine.js');
-const D = path.join(__dirname, '..', '..', 'data');
+const D = path.join(__dirname, '..', '..', 'portfolio-sheet-data', 'data');
 
 function csvMap(file, col = '종가') {
   const m = new Map();

@@ -1,7 +1,7 @@
 /* 똑재TV 백테스트 계산기 — 화면 (계산은 engine.js 의 BT.simulate) */
 'use strict';
 
-const DATA = '../data/';                         // portfolio-sheet-data/data/
+const DATA = '/portfolio-sheet-data/data/';       // 데이터는 ttokjaeTV/portfolio-sheet-data 저장소 (같은 사이트라 CORS 없음)
 const MAX_HOLDINGS = 10;
 const KR_STOCK_SAFE_START = '2000-01';           // 국내 주식 2000년 이전 데이터는 불안정
 const FX_START = '1990-03';
