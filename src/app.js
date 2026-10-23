@@ -2,6 +2,7 @@
 'use strict';
 
 const DATA = '/portfolio-sheet-data/data/';       // 데이터는 ttokjaeTV/portfolio-sheet-data 저장소 (같은 사이트라 CORS 없음)
+const DAILY_DATA = '/backtest-daily/';            // 주요 종목 일별 데이터 — ttokjaeTV/backtest-daily (gh-pages)
 const MAX_HOLDINGS = 10;
 const KR_STOCK_SAFE_START = '2000-01';           // 국내 주식 2000년 이전 데이터는 불안정
 const FX_START = '1990-03';
@@ -21,6 +22,7 @@ const S = {
   mode: 'mix', initial: 1000, monthly: 50,
   start: '', end: '', periodAuto: true,
   reinvest: true, rebalance: false, fxKRW: true,
+  freq: 'm', day: 'L', wd: 1,    // 일별 계산의 적립 주기 · 매월 적립일(1~28, 'L'=말일) · 매주 요일(1=월)
 };
 let nextId = 1;
 let searchMarket = 'ALL';
@@ -33,6 +35,10 @@ let UPDATED = '';
 const LIVE = { month: '', fx: null, fxDate: '', files: new Map() };
 const LIVE_FILE = { KE: ['etf_prices.csv', '종목코드', '현재가'], KS: ['kr_stocks.csv', '종목코드', '현재가'], U: ['us_prices.csv', '티커', '현재가USD'] };
 const ASSET = new Map();         // 키 → Promise<{px, dv}>
+// 일별 — 대상 종목(키 → {first, last})이 모두 들어 있으면 거래일 단위로 계산한다
+const DAILY = new Map();
+const DASSET = new Map();        // 키 → Promise<{px, dv}> (날짜 단위)
+let DFX = null;                  // Promise<Map(날짜 → 매매기준율)>
 const charts = {};
 
 // ── 유틸 ────────────────────────────────────────────────
@@ -62,7 +68,7 @@ function fmtWonFine(n) {                          // 월평균 배당처럼 작�
   n = Number(n); if (!isFinite(n)) return '-';
   return Math.abs(n) < 1e5 ? (n < 0 ? '-' : '') + Math.round(Math.abs(n)).toLocaleString() + '원' : fmtWon(n);
 }
-const divAvgMonths = r => Math.min(12, r.n);      // 월평균 배당을 낸 개월 수 — 엔진 monthlyDivAvg(최근 배당 합 ÷ min(12, n))와 같게
+const divAvgMonths = r => r.divMonths;             // 월평균 배당을 낸 개월 수 — 엔진 monthlyDivAvg(최근 배당 합 ÷ divMonths)와 같게
 function fmtShort(n) {                            // 차트 축: 1.5억 / 3,000만
   const a = Math.abs(n), sg = n < 0 ? '-' : '';
   if (a >= 1e8) return sg + (a / 1e8).toFixed(a >= 1e9 ? 0 : 1).replace(/\.0$/, '') + '억';
@@ -78,8 +84,8 @@ function parseCSV(text) {
   const head = lines.shift().replace(/^﻿/, '').split(',');
   return lines.map(l => { const c = l.split(','); const o = {}; head.forEach((h, i) => { o[h] = c[i]; }); return o; });
 }
-async function getText(path) {
-  const r = await fetch(DATA + path, { cache: 'default' });
+async function getText(path, base = DATA) {
+  const r = await fetch(base + path, { cache: 'default' });
   if (!r.ok) throw new Error(`${path} ${r.status}`);
   return r.text();
 }
@@ -163,6 +169,50 @@ function loadAsset(key) {
   return ASSET.get(key);
 }
 
+// ── 일별 데이터 ─────────────────────────────────────────
+async function loadDailyIndex() {
+  try {
+    const idx = JSON.parse(await getText('index.json', DAILY_DATA));
+    const d = n => `${String(n).slice(0, 4)}-${String(n).slice(4, 6)}-${String(n).slice(6, 8)}`;
+    idx.rows.forEach(([key, , , s, e, div]) => DAILY.set(key, { first: d(s), last: d(e), div: !!div }));
+  } catch (e) { /* 일별 목록을 못 읽으면 전부 월말 기준으로 계산한다 */ }
+}
+function dayMapOf(text) {
+  return new Map(parseCSV(text).filter(r => r['종가'] || r['금액'] || r['매매기준율'])
+    .map(r => [r['날짜'], +(r['종가'] || r['금액'] || r['매매기준율'])]));
+}
+function loadDaily(key) {
+  if (!DASSET.has(key)) {
+    const [mk, code] = key.split(':'), f = toFilename(code);
+    DASSET.set(key, (async () => {
+      const px = dayMapOf(await getText(`${mk}/${f}.csv`, DAILY_DATA));
+      const dv = DAILY.get(key).div ? dayMapOf(await getText(`div/${mk}/${f}.csv`, DAILY_DATA)) : new Map();
+      return { px, dv };
+    })().catch(e => { DASSET.delete(key); throw e; }));
+  }
+  return DASSET.get(key);
+}
+function loadDailyFx() {
+  if (!DFX) DFX = getText('fx.csv', DAILY_DATA).then(dayMapOf).catch(e => { DFX = null; throw e; });
+  return DFX;
+}
+// 고른 종목이 모두 일별 대상이면 일별로 계산한다
+const isDailySet = (keys = S.holdings.filter(h => h.key).map(h => h.key)) => keys.length > 0 && keys.every(k => DAILY.has(k));
+// 일별 가능한 첫 달 — 상장 첫날이 그달 초가 아니면 다음 달부터 (시작 달 첫 거래일 가격이 있어야 매주·매일 적립이 된다)
+function dailyStartOf(key) {
+  const f = DAILY.get(key).first;
+  return +f.slice(8, 10) > 7 ? fromNum(mnum(f.slice(0, 7)) + 1) : f.slice(0, 7);
+}
+// 이번 달 30분 시세를 일별 마지막 날 뒤에 붙일 날짜 (국내 = 갱신 날짜, 미국 = 한국 시각 14시간 전 날짜 = 미국 거래일)
+function liveDay(it, stamp) {
+  if (!stamp) return '';
+  const t = new Date(stamp.replace(' ', 'T') + ':00Z');           // 갱신시각은 한국 시각 — UTC 로 읽고 그대로 날짜 계산
+  if (isNaN(t)) return '';
+  if (it.mk === 'U') t.setUTCHours(t.getUTCHours() - 14);
+  const dow = t.getUTCDay();
+  return dow === 0 || dow === 6 ? '' : t.toISOString().slice(0, 10);
+}
+
 // ── 검색 ────────────────────────────────────────────────
 function searchUniverse(q) {
   const nq = normText(q); if (!nq) return [];
@@ -192,7 +242,7 @@ function optionHtml(key, idx) {
   const it = U.get(key); if (!it) return '';
   const badge = it.mk === 'K' ? `<span class="kbadge kr">국내 ${it.kind}</span>` : `<span class="kbadge us">미국 ${it.kind}</span>`;
   return `<div class="combo-opt" data-key="${escapeHtml(key)}" data-idx="${idx}">
-    <div class="opt-name">${escapeHtml(it.mk === 'U' ? it.code + ' · ' + it.name : it.name)}</div>
+    <div class="opt-name">${escapeHtml(it.mk === 'U' ? it.code + ' · ' + it.name : it.name)}${DAILY.has(key) ? '<span class="opt-daily">일별</span>' : ''}</div>
     <div class="opt-sub">${badge}<span>${escapeHtml(it.code)}</span><span>${it.start} ~</span>${it.div ? '' : '<span>배당 기록 없음</span>'}</div>
   </div>`;
 }
@@ -277,6 +327,7 @@ function holdingInfo(h) {
   const it = U.get(h.key);
   if (!it) return '<div class="bt-span">종목을 골라 주세요</div>';
   const parts = [`<b>${it.start}</b>부터 데이터`];
+  if (DAILY.has(h.key)) parts.push(`일별 데이터 ${dailyStartOf(h.key)}~`);
   if (it.mk === 'U') parts.push('달러 종목');
   if (it.src === 'n') parts.push('분배금이 가격에 이미 반영된 네이버 가격');
   else if (!it.div) parts.push('배당 기록 없음');
@@ -341,12 +392,16 @@ function setCombo(str) {
 function periodRange() {
   const its = S.holdings.map(h => U.get(h.key)).filter(Boolean);
   if (!its.length) return null;
-  let lo = its.reduce((m, it) => maxM(m, it.start), '0000-00'), limiter = its.find(it => it.start === lo);
-  const hi = its.reduce((m, it) => minM(m, endOf(it)), '9999-99');
+  const daily = isDailySet(its.map(it => it.key));
+  // 일별이면 일별 데이터 기간, 아니면 월별 데이터 기간
+  const startOf = it => (daily ? dailyStartOf(it.key) : it.start);
+  const lastOf = it => (daily ? maxM(DAILY.get(it.key).last.slice(0, 7), endOf(it)) : endOf(it));
+  let lo = its.reduce((m, it) => maxM(m, startOf(it)), '0000-00'), limiter = its.find(it => startOf(it) === lo);
+  const hi = its.reduce((m, it) => minM(m, lastOf(it)), '9999-99');
   if (its.some(it => it.mk === 'U') && lo < FX_START) { lo = FX_START; limiter = null; }
   // 시작 달은 그 달 종가를 쓰므로 데이터 첫 달부터 가능
   const safeLo = its.some(it => it.mk === 'K' && it.kind === '주식') ? maxM(lo, KR_STOCK_SAFE_START) : lo;
-  return { lo, hi, safeLo, limiter: its.length > 1 ? limiter : null };
+  return { lo, hi, safeLo, daily, limiter: its.length > 1 ? limiter : null, limStart: limiter ? startOf(limiter) : '' };
 }
 function applyPeriod() {
   const r = periodRange();
@@ -379,10 +434,25 @@ function readInputs() {
   S.initial = Math.max(0, Number($('initial').value) || 0);
   S.monthly = Math.max(0, Number($('monthly').value) || 0);
   S.reinvest = $('reinvest').checked; S.rebalance = $('rebalance').checked; S.fxKRW = $('fxmode').checked;
+  S.day = $('buy-day').value === 'L' ? 'L' : +$('buy-day').value || 'L';
+  S.wd = +$('buy-wd').value || 1;
+  const daily = isDailySet();
   $('initial-hint').textContent = fmtWon(S.initial * 1e4);
-  $('monthly-hint').textContent = `매달 말 ${fmtWon(S.monthly * 1e4)}`;
+  $('monthly-hint').textContent = daily ? `한 달 ${fmtWon(S.monthly * 1e4)} (아래 주기로 나눠 넣음)` : `매달 말 ${fmtWon(S.monthly * 1e4)}`;
   $('initial-box').style.display = S.mode === 'dca' ? 'none' : '';
   $('monthly-box').style.display = S.mode === 'lump' ? 'none' : '';
+  // 적립 주기는 일별 계산이고 적립이 있을 때만
+  $('daily-box').style.display = daily && S.mode !== 'lump' ? '' : 'none';
+  $('buy-day').style.display = S.freq === 'm' ? '' : 'none';
+  $('buy-wd').style.display = S.freq === 'w' ? '' : 'none';
+  const m = S.monthly * 1e4;
+  $('freq-hint').textContent = S.freq === 'm' ? `매월 ${S.day === 'L' ? '마지막 거래일' : `${S.day}일(휴장이면 다음 거래일)`}에 ${fmtWon(m)}`
+    : S.freq === 'w' ? `매주 ${'월화수목금'[S.wd - 1]}요일(휴장이면 그 주 다음 거래일)에 ${fmtWonFine(m * 12 / 52)} · 한 달 평균 ${fmtWon(m)}`
+    : `매 거래일 ${fmtWonFine(m / 21)} 안팎 (그달 거래일 수로 나눔) · 한 달 ${fmtWon(m)}`;
+}
+// 계산 방식에 쓰는 말 — 월별 결과·안내 문구에서 같이 쓴다
+function freqText() {
+  return S.freq === 'm' ? `매월 ${S.day === 'L' ? '말일' : S.day + '일'}` : S.freq === 'w' ? `매주 ${'월화수목금'[S.wd - 1]}요일` : '매일';
 }
 function showEmpty(msg) {
   $('results-empty').style.display = msg ? '' : 'none';
@@ -399,6 +469,7 @@ async function run() {
   const monthly = S.mode === 'lump' ? 0 : S.monthly * 1e4;
   if (initial + monthly <= 0) return showEmpty('초기 투자금이나 월 적립액을 넣어 주세요.');
   const range = applyPeriod();
+  if (range.daily) return runDaily(seq, hs, range, initial, monthly);
   let data;
   const useLive = S.end === LIVE.month;
   let live = [];
@@ -431,20 +502,58 @@ async function run() {
   render(r, hs, range, { initial, monthly });
   syncUrl();
 }
+// 일별 — 일별 데이터(어제 종가까지)에 이번 달이면 30분 시세를 오늘 값으로 붙인다
+async function runDaily(seq, hs, range, initial, monthly) {
+  const useLive = S.end === LIVE.month;
+  let data, live = [], dfx;
+  try {
+    [data, dfx] = await Promise.all([Promise.all(hs.map(h => loadDaily(h.key))), loadDailyFx(), loadFlags()]);
+    if (useLive) live = await Promise.all(hs.map(h => loadLive(liveKind(U.get(h.key)))));
+  } catch (e) { return showEmpty('종목 데이터를 불러오지 못했습니다. 잠시 뒤 새로고침해 주세요.'); }
+  if (seq !== runSeq) return;
+  const stamps = [];
+  const assets = hs.map((h, i) => {
+    const it = U.get(h.key);
+    let px = data[i].px;
+    const v = useLive && live[i].m.get(it.code), day = useLive ? liveDay(it, live[i].stamp) : '';
+    const lastDay = DAILY.get(h.key).last;
+    // 마지막 일별 날짜보다 뒤이고 값이 바뀌었을 때만 (장 시작 전·휴장일엔 어제 종가 그대로라 붙이지 않는다)
+    if (v && day > lastDay && day.slice(0, 7) === LIVE.month && v !== px.get(lastDay)) {
+      px = new Map(px); px.set(day, v); stamps.push(live[i].stamp);
+    }
+    return { key: h.key, name: it.label, ccy: it.mk === 'U' ? 'USD' : 'KRW', px, dv: data[i].dv, w: h.w };
+  });
+  let fx = dfx;
+  if (useLive && LIVE.fx && LIVE.fxDate && !dfx.has(LIVE.fxDate)) { fx = new Map(dfx); fx.set(LIVE.fxDate, LIVE.fx); }
+  S.liveStamp = stamps.sort()[0] || '';
+  let r;
+  try {
+    r = BT.simulateDaily({ assets, fx, start: S.start, end: S.end, initial, monthly, reinvest: S.reinvest,
+      rebalance: S.rebalance ? 12 : 0, fxMode: S.fxKRW ? 'krw' : 'fixed', freq: S.freq, day: S.day, wd: S.wd });
+  } catch (e) { return showEmpty(escapeHtml(e.message)); }
+  showEmpty('');
+  render(r, hs, range, { initial, monthly });
+  syncUrl();
+}
 
 // ── 결과 그리기 ─────────────────────────────────────────
 function recovery(r) {
-  // 최대 낙폭 바닥 이후 이전 고점을 처음 넘은 달
+  // 최대 낙폭 바닥 이후 이전 고점을 처음 넘은 시점 (월별: 개월 수, 일별: 날짜 차이)
   const t0 = r.months.indexOf(r.mddAt);
   let peak = 0; for (let t = 0; t <= t0; t++) peak = Math.max(peak, r.idx[t]);
-  for (let t = t0 + 1; t <= r.n; t++) if (r.idx[t] >= peak) return { m: r.months[t], gap: t - t0 };
+  for (let t = t0 + 1; t <= r.n; t++) if (r.idx[t] >= peak) return { m: r.months[t], text: r.daily ? daysText(r.mddAt, r.months[t]) : spanText(t - t0) };
   return null;
+}
+// 날짜 사이 기간: 두 달 미만은 'N일', 그 이상은 개월·년
+function daysText(a, b) {
+  const days = Math.round((Date.parse(b) - Date.parse(a)) / 864e5);
+  return days < 60 ? `${days}일` : spanText(Math.round(days / 30.44));
 }
 function warnings(r, hs, range) {
   const out = [];
   if (range.limiter && range.lo === S.start)
-    out.push(`가장 늦게 상장한 <b>${escapeHtml(range.limiter.label)}</b>(${range.limiter.start}) 때문에 그보다 앞선 기간은 계산할 수 없습니다.`);
-  if (r.n < 36) out.push(`기간이 <b>${spanText(r.n)}</b>밖에 안 됩니다. 짧은 기간의 결과는 우연에 크게 좌우되니 긴 기간과 함께 보세요.`);
+    out.push(`가장 늦게 상장한 <b>${escapeHtml(range.limiter.label)}</b>(${range.limStart}) 때문에 그보다 앞선 기간은 계산할 수 없습니다.`);
+  if (r.spanMonths < 36) out.push(`기간이 <b>${spanText(r.spanMonths)}</b>밖에 안 됩니다. 짧은 기간의 결과는 우연에 크게 좌우되니 긴 기간과 함께 보세요.`);
   const krS = hs.map(h => U.get(h.key)).filter(it => it.mk === 'K' && it.kind === '주식');
   if (krS.length && S.start < KR_STOCK_SAFE_START)
     out.push('국내 주식의 <b>2000년 이전 데이터</b>에는 값이 튀는 오류가 섞여 있을 수 있습니다.');
@@ -454,23 +563,32 @@ function warnings(r, hs, range) {
   }));
   if (flagged.length)
     out.push(`한 달에 5배 이상 오르거나 80% 이상 빠진 구간이 있습니다: <b>${escapeHtml(flagged.slice(0, 4).join(', '))}</b>${flagged.length > 4 ? ` 외 ${flagged.length - 4}곳` : ''}. 실제 급등락일 수도, 데이터 오류일 수도 있습니다.`);
-  if (S.end === LIVE.month)
+  if (!r.daily) {
+    const some = hs.filter(h => DAILY.has(h.key)).length, no = hs.filter(h => !DAILY.has(h.key)).map(h => U.get(h.key).label);
+    if (some && no.length) out.push(`<b>${escapeHtml(no.slice(0, 3).join(', '))}</b>${no.length > 3 ? ` 외 ${no.length - 3}종목` : ''}에 일별 데이터가 없어 월말 기준으로 계산했습니다. 일별 표시가 있는 종목끼리 고르면 거래일 단위로 계산합니다.`);
+  }
+  if (r.daily && S.end === LIVE.month && S.liveStamp)
+    out.push(`이번 달은 어제까지 종가에 <b>${escapeHtml(S.liveStamp)} 시세</b>를 오늘 값으로 붙여 계산했습니다.`);
+  if (!r.daily && S.end === LIVE.month)
     out.push(`끝 월(${S.end})은 아직 끝나지 않은 달이라 <b>${escapeHtml(S.liveStamp || '최근')} 시세</b>로 계산했습니다${hs.some(h => h.key.startsWith('U:')) && LIVE.fxDate ? ` (환율 ${escapeHtml(LIVE.fxDate)} 매매기준율)` : ''}. 이번 달 미국 종목 배당은 매주 토요일에 반영됩니다.`);
   return out;
 }
 function render(r, hs, range, amt) {
-  const yrs = spanText(r.n);
+  const yrs = spanText(r.spanMonths);
   const usdAny = hs.some(h => h.key.startsWith('U:'));
-  $('data-basis').innerHTML = `${S.start} ~ ${S.end} (${yrs}) · 매달 말 종가${S.end === LIVE.month && S.liveStamp ? ` (이번 달은 ${escapeHtml(S.liveStamp)} 시세)` : ''}` +
-    (usdAny ? ` · 미국 종목 ${S.fxKRW ? '원화 환산(매매기준율)' : `시작 달 환율 ${r.fx0.toLocaleString()}원 고정`}` : '');
-  $('bt-warnings').innerHTML = warnings(r, hs, range).map(w => `<div class="bt-warn${(w.startsWith('가장 늦게') || w.startsWith('끝 월')) ? ' soft' : ''}">${w}</div>`).join('');
+  const badge = r.daily ? '<span class="calc-badge">일별 정밀 계산</span>' : '<span class="calc-badge monthly">월말 기준 계산</span>';
+  const when = r.daily ? `${r.labels[0]} ~ ${r.labels[r.n]} (${yrs}) · 매 거래일 종가` + (S.mode !== 'lump' ? ` · ${freqText()} 적립` : '')
+    : `${S.start} ~ ${S.end} (${yrs}) · 매달 말 종가${S.end === LIVE.month && S.liveStamp ? ` (이번 달은 ${escapeHtml(S.liveStamp)} 시세)` : ''}`;
+  $('data-basis').innerHTML = badge + when +
+    (usdAny ? ` · 미국 종목 ${S.fxKRW ? '원화 환산(매매기준율)' : `시작${r.daily ? '일' : ' 달'} 환율 ${r.fx0.toLocaleString()}원 고정`}` : '');
+  $('bt-warnings').innerHTML = warnings(r, hs, range).map(w => `<div class="bt-warn${(w.startsWith('가장 늦게') || w.startsWith('끝 월') || w.startsWith('이번 달은') || w.includes('월말 기준으로 계산했습니다')) ? ' soft' : ''}">${w}</div>`).join('');
   $('group-desc').textContent = `${S.reinvest ? '배당 재투자' : '배당 현금 수령'} · ${S.rebalance ? '매년 리밸런싱' : '리밸런싱 안 함'} · 수수료·세금 제외`;
 
   const gain = r.finalValue - r.invested;
   $('r-final').textContent = fmtWon(r.finalValue);
   $('r-final-sub').textContent = S.reinvest ? `${yrs} 뒤 평가액` : `보유 ${fmtWon(r.holdings)} + 쌓인 배당 현금 ${fmtWon(r.cash)}`;
   $('r-invested').textContent = fmtWon(r.invested);
-  $('r-invested-sub').textContent = [amt.initial ? `처음 ${fmtWon(amt.initial)}` : '', amt.monthly ? `월 ${fmtWon(amt.monthly)} × ${r.n + 1}번` : ''].filter(Boolean).join(' + ');
+  $('r-invested-sub').textContent = [amt.initial ? `처음 ${fmtWon(amt.initial)}` : '', amt.monthly ? (r.daily && S.freq !== 'm' ? `${freqText()} ${r.contribCount.toLocaleString()}번 (한 달 ${fmtWon(amt.monthly)})` : `월 ${fmtWon(amt.monthly)} × ${r.contribCount}번`) : ''].filter(Boolean).join(' + ');
   $('r-gain').textContent = (gain >= 0 ? '+' : '') + fmtWon(gain);
   $('r-gain').className = 'stat-value ' + cls(gain);
   $('r-gain-sub').textContent = `원금 대비 ${pct(gain / r.invested)}`;
@@ -484,7 +602,7 @@ function render(r, hs, range, amt) {
     : r.irr != null && amt.monthly ? `내 돈 기준 연 ${pct(r.irr)}` : '상품 자체 성과(배당 포함)';
   $('r-mdd').textContent = pctPlain(r.mdd);
   const rec = recovery(r);
-  $('r-mdd-sub').textContent = r.mdd > -0.001 ? '빠진 적 없음' : `${r.mddAt} 바닥 · ${rec ? `${spanText(rec.gap)} 만에 회복` : '아직 회복 전'}`;
+  $('r-mdd-sub').textContent = r.mdd > -0.001 ? '빠진 적 없음' : `${r.mddAt} 바닥 · ${rec ? `${rec.text} 만에 회복` : '아직 회복 전'}`;
   if (r.worst) {
     $('r-worst').textContent = pct(r.worst.ret); $('r-worst').className = 'stat-value ' + cls(r.worst.ret); $('r-worst-sub').textContent = `${r.worst.year}년`;
     $('r-best').textContent = pct(r.best.ret); $('r-best').className = 'stat-value ' + cls(r.best.ret); $('r-best-sub').textContent = `${r.best.year}년`;
@@ -510,15 +628,30 @@ function baseOpts(yFmt) {
   };
 }
 function chart(id, cfg) { if (charts[id]) charts[id].destroy(); charts[id] = new Chart($(id), cfg); }
+// 차트용 점 줄이기 — 일별은 수천 개라 구간별 마지막 값으로 줄이되, 낙폭은 구간 최저값을 남겨 바닥이 사라지지 않게 한다
+function chartSeries(r) {
+  const N = r.n + 1, MAX = 900;
+  const val = r.rows.map(x => x.value + x.cash), inv = r.rows.map(x => x.invested);
+  if (N <= MAX * 1.5) return { labels: r.months, val, inv, dd: r.dd };
+  const b = Math.ceil(N / MAX), out = { labels: [], val: [], inv: [], dd: [] };
+  for (let i = 0; i < N; i += b) {
+    const j = Math.min(N - 1, i + b - 1);
+    let k = i; for (let t = i; t <= j; t++) if (r.dd[t] < r.dd[k]) k = t;
+    out.labels.push(r.months[j]); out.val.push(val[j]); out.inv.push(inv[j]); out.dd.push(r.dd[k]);
+  }
+  return out;
+}
 function drawCharts(r) {
   const won = (v, axis) => axis ? fmtShort(v) : fmtWon(v);
-  chart('c1', { type: 'line', data: { labels: r.months, datasets: [
-    { label: '최종 금액', data: r.rows.map(x => x.value + x.cash), borderColor: COLORS[0], backgroundColor: 'rgba(217,84,43,.08)', fill: true, borderWidth: 2.2, pointRadius: 0, tension: .15 },
-    { label: '넣은 돈', data: r.rows.map(x => x.invested), borderColor: COLORS[3], borderDash: [6, 4], borderWidth: 1.8, pointRadius: 0, fill: false, stepped: true },
+  const cs = chartSeries(r);
+  $('c1-sub').textContent = `${r.daily ? '매 거래일' : '매달 말'} 평가액 (배당을 현금으로 받으면 쌓인 현금 포함)`;
+  chart('c1', { type: 'line', data: { labels: cs.labels, datasets: [
+    { label: '최종 금액', data: cs.val, borderColor: COLORS[0], backgroundColor: 'rgba(217,84,43,.08)', fill: true, borderWidth: 2.2, pointRadius: 0, tension: .15 },
+    { label: '넣은 돈', data: cs.inv, borderColor: COLORS[3], borderDash: [6, 4], borderWidth: 1.8, pointRadius: 0, fill: false, stepped: true },
   ] }, options: baseOpts(won) });
   const p = (v, axis) => axis ? Math.round(v * 100) + '%' : (v * 100).toFixed(1) + '%';
-  chart('c2', { type: 'line', data: { labels: r.months, datasets: [
-    { label: '고점 대비', data: r.dd, borderColor: '#2E5E8A', backgroundColor: 'rgba(46,94,138,.15)', fill: true, borderWidth: 1.6, pointRadius: 0, tension: .1 },
+  chart('c2', { type: 'line', data: { labels: cs.labels, datasets: [
+    { label: '고점 대비', data: cs.dd, borderColor: '#2E5E8A', backgroundColor: 'rgba(46,94,138,.15)', fill: true, borderWidth: 1.6, pointRadius: 0, tension: .1 },
   ] }, options: Object.assign(baseOpts(p), { plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => `고점 대비 ${p(c.parsed.y)}` } } } }) });
   const ys = r.yearly;
   chart('c3', { type: 'bar', data: { labels: ys.map(y => y.partial ? `${y.year}*` : y.year), datasets: [
@@ -551,11 +684,11 @@ function drawTables(r, hs) {
 function drawInsight(r, hs, rec) {
   const names = hs.map(h => U.get(h.key).label);
   const who = names.length === 1 ? names[0] : `${names[0]} 등 ${names.length}종목`;
-  $('insight-title').textContent = `${S.start}부터 ${spanText(r.n)}, 넣은 돈 ${fmtWon(r.invested)} → ${fmtWon(r.finalValue)}`;
+  $('insight-title').textContent = `${r.daily ? r.labels[0] : S.start}부터 ${spanText(r.spanMonths)}, 넣은 돈 ${fmtWon(r.invested)} → ${fmtWon(r.finalValue)}`;
   let d = `${escapeHtml(who)}에 투자했다면 연평균 <strong>${pct(r.cagr)}</strong>(배당 포함, 상품 자체 성과)였습니다. `;
   if (!S.reinvest && r.irr != null && r.totalDiv > 0)
     d += `다만 이 숫자는 배당을 바로 재투자했다고 가정한 값이고, 배당을 현금으로 받아 쌓아 두면 <strong>실제 내 돈 기준으로는 연 ${pct(r.irr)}</strong>입니다. `;
-  if (r.mdd < -0.001) d += `하지만 그 사이 고점 대비 <strong>${pctPlain(r.mdd)}</strong>까지 빠진 적이 있고(${r.mddAt}), ${rec ? `원래 수준을 되찾는 데 <strong>${spanText(rec.gap)}</strong>이 걸렸습니다` : '아직 그 고점을 되찾지 못했습니다'}. `;
+  if (r.mdd < -0.001) d += `하지만 그 사이 고점 대비 <strong>${pctPlain(r.mdd)}</strong>까지 빠진 적이 있고(${r.mddAt}), ${rec ? `원래 수준을 되찾는 데 <strong>${rec.text}</strong>이 걸렸습니다` : '아직 그 고점을 되찾지 못했습니다'}. `;
   if (r.worst) d += `최악의 해는 ${r.worst.year}년(${pct(r.worst.ret)})이었습니다. `;
   d += '<br><br>최종 금액만큼 중요한 건 <strong>그 하락 구간을 실제로 버틸 수 있었는지</strong>입니다. 같은 종목도 기간을 바꾸면 결과가 크게 달라지니, 위의 빠른 기간 버튼으로 하락장 전후도 꼭 돌려 보세요.';
   if (hs.some(h => h.key.startsWith('U:')) && S.fxKRW && r.fxN) {
@@ -573,6 +706,10 @@ function stateQuery() {
   p.set('mode', S.mode); p.set('i', S.initial); p.set('m', S.monthly);
   if (!S.periodAuto) { p.set('s', S.start); p.set('e', S.end); }
   p.set('r', S.reinvest ? 1 : 0); p.set('b', S.rebalance ? 1 : 0); p.set('fx', S.fxKRW ? 'krw' : 'usd');
+  // 일별 적립 설정 — 기본값(매월 말일)이면 넣지 않아 예전 링크와 같은 모양
+  if (S.freq !== 'm') p.set('freq', S.freq);
+  if (S.freq === 'm' && S.day !== 'L') p.set('day', S.day);
+  if (S.freq === 'w') p.set('wd', S.wd);
   return p.toString();
 }
 function syncUrl() { try { history.replaceState(null, '', '?' + stateQuery()); } catch (e) { /* file:// 등 */ } }
@@ -590,6 +727,10 @@ function readUrl() {
   $('reinvest').checked = p.get('r') !== '0';
   $('rebalance').checked = p.get('b') === '1';
   $('fxmode').checked = p.get('fx') !== 'usd';
+  if (['m', 'w', 'd'].includes(p.get('freq'))) S.freq = p.get('freq');
+  const day = p.get('day');
+  if (/^\d+$/.test(day || '') && +day >= 1 && +day <= 28) S.day = +day;
+  if (/^[1-5]$/.test(p.get('wd') || '')) S.wd = +p.get('wd');
   return true;
 }
 function copyText() {
@@ -618,6 +759,10 @@ function bind() {
   document.querySelectorAll('#mode-seg button').forEach(b => b.addEventListener('click', () => {
     S.mode = b.dataset.v; document.querySelectorAll('#mode-seg button').forEach(x => x.classList.toggle('on', x === b)); schedule();
   }));
+  document.querySelectorAll('#freq-seg button').forEach(b => b.addEventListener('click', () => {
+    S.freq = b.dataset.v; document.querySelectorAll('#freq-seg button').forEach(x => x.classList.toggle('on', x === b)); schedule();
+  }));
+  ['buy-day', 'buy-wd'].forEach(id => $(id).addEventListener('change', schedule));
   ['initial', 'monthly'].forEach(id => $(id).addEventListener('input', () => { placeUnits(); schedule(); }));
   ['reinvest', 'rebalance', 'fxmode'].forEach(id => $(id).addEventListener('change', schedule));
   $('start').addEventListener('change', () => { if ($('start').value) { S.start = $('start').value; S.periodAuto = false; schedule(); } });
@@ -628,14 +773,18 @@ function bind() {
   window.addEventListener('resize', placeUnits);
 }
 async function init() {
+  $('buy-day').innerHTML = '<option value="L">마지막 거래일</option>' +
+    Array.from({ length: 28 }, (_, i) => `<option value="${i + 1}">${i + 1}일</option>`).join('');
   bind();
   if (!readUrl()) S.holdings = [{ id: nextId++, key: 'U:SCHD', w: 50 }, { id: nextId++, key: 'U:QQQ', w: 50 }];
   document.querySelectorAll('#mode-seg button').forEach(x => x.classList.toggle('on', x.dataset.v === S.mode));
+  document.querySelectorAll('#freq-seg button').forEach(x => x.classList.toggle('on', x.dataset.v === S.freq));
+  $('buy-day').value = String(S.day); $('buy-wd').value = String(S.wd);
   renderHoldings();
   try {
-    await Promise.all([loadIndex(), loadLiveFx()]);
+    await Promise.all([loadIndex(), loadLiveFx(), loadDailyIndex()]);
     const n = UL.length.toLocaleString();
-    $('data-status').innerHTML = `<span class="ds-dot ok"></span>국내·미국 ${n}종목 <span class="ds-date">· 가격 매일·배당 국내 매일/미국 매주 갱신</span>`;
+    $('data-status').innerHTML = `<span class="ds-dot ok"></span>국내·미국 ${n}종목${DAILY.size ? ` (주요 ${DAILY.size.toLocaleString()}종목은 일별)` : ''} <span class="ds-date">· 가격 매일·배당 국내 매일/미국 매주 갱신</span>`;
   } catch (e) {
     $('data-status').innerHTML = '<span class="ds-dot"></span>종목 데이터를 불러오지 못했습니다. 새로고침해 주세요.';
     return showEmpty('종목 데이터를 불러오지 못했습니다. 잠시 뒤 새로고침해 주세요.');

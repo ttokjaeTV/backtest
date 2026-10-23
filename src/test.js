@@ -114,5 +114,82 @@ for (const code of ['069500', '360750', '458730', '161510']) {
   console.log(`  SPY50/TLT50 매년 리밸런싱 연 ${(r.cagr * 100).toFixed(2)}% · MDD ${(r.mdd * 100).toFixed(1)}% (${r.mddAt})`);
 }
 
+// ── 일별 (BT.simulateDaily) — 데이터는 옆 폴더 ../backtest-daily/site (gh-pages) ─────────────
+const DD = path.join(__dirname, '..', '..', 'backtest-daily', 'site');
+function dayMap(file, col) {
+  const m = new Map();
+  if (!fs.existsSync(file)) return m;
+  const lines = fs.readFileSync(file, 'utf8').replace(/\r/g, '').trim().split('\n');
+  lines.shift();
+  lines.forEach(l => { const c = l.split(','); if (c[1]) m.set(c[0], +c[1]); });
+  return m;
+}
+if (fs.existsSync(DD)) {
+  console.log('\n── 일별 ──');
+  const dfx = dayMap(path.join(DD, 'fx.csv'));
+  const dasset = (key, w = 100) => {
+    const [mk, code] = key.split(':');
+    return { key, name: code, ccy: mk === 'U' ? 'USD' : 'KRW', px: dayMap(path.join(DD, mk, `${code}.csv`)), dv: dayMap(path.join(DD, 'div', mk, `${code}.csv`)), w };
+  };
+  const dbase = { ...base, fx: dfx };
+
+  // 8) 공개 10년 총수익률 — 월별과 같은 기준
+  for (const [t, want] of [['SPY', 0.130], ['SCHD', 0.110], ['QQQ', 0.183]]) {
+    const r = BT.simulateDaily({ ...dbase, assets: [dasset('U:' + t)], start: '2014-12', end: '2024-12' });
+    check(`${t} 10년 연평균 일별(달러 기준)`, r.cagr, want, 0.003);
+  }
+
+  // 9) 매월 말일 적립 일별 ≈ 월별 (배당 받는 시점 차이만큼만 다르다), 넣은 돈·횟수는 똑같다
+  for (const keys of [['U:SCHD'], ['K:069500'], ['K:005930'], ['U:SPY', 'K:133690']]) {
+    const opt = { ...base, fxMode: 'krw', initial: 0, monthly: 500000, start: '2015-01', end: '2024-12' };
+    const m = BT.simulate({ ...opt, assets: keys.map(k => asset(k, 100 / keys.length)) });
+    const d = BT.simulateDaily({ ...opt, fx: dfx, assets: keys.map(k => dasset(k, 100 / keys.length)), freq: 'm', day: 'L' });
+    check(`${keys.join('+')} 월말 적립 일별 vs 월별 내 돈 기준`, d.irr, m.irr, 0.003);
+    if (d.invested !== m.invested || d.contribCount !== m.n + 1) { fail++; console.log(`✗ ${keys} 넣은 돈 ${d.invested} vs ${m.invested} · 횟수 ${d.contribCount}`); }
+  }
+
+  // 10) 최대 낙폭 — 일별은 월말끼리보다 깊다 (S&P500 2020 코로나: 일별 약 −34%, 월별 약 −20%)
+  {
+    const d = BT.simulateDaily({ ...dbase, assets: [dasset('U:SPY')], start: '2019-12', end: '2020-12' });
+    const m = BT.simulate({ ...base, assets: [asset('U:SPY')], start: '2019-12', end: '2020-12' });
+    console.log(`  SPY 2020 MDD 일별 ${(d.mdd * 100).toFixed(1)}% (${d.mddAt}) · 월별 ${(m.mdd * 100).toFixed(1)}% (${m.mddAt})`);
+    check('SPY 2020 일별 MDD', d.mdd, -0.337, 0.01);
+    if (d.mddAt !== '2020-03-23') { fail++; console.log('✗ 바닥 날짜가 2020-03-23 이 아님'); }
+  }
+
+  // 11) 국내 ETF — KRX 실제 종가 + 분배금(배당락일) 재투자 = 네이버 분배금 보정가 (월별 2번과 같은 검산)
+  for (const code of ['069500', '360750', '161510']) {
+    const nv = dayMap(path.join(D, 'history', 'kr_etf_daily', `${code}.csv`));
+    const a = dasset('K:' + code);
+    const first = [...a.px.keys()].sort()[0].slice(0, 7);
+    const s = first >= '2015-01' ? BT.monthsBetween(first, '2026-09')[1] : '2015-01';      // 상장 다음 달부터
+    const r = BT.simulateDaily({ ...dbase, assets: [a], start: s, end: '2026-09' });
+    const d0 = r.labels[0], dn = r.labels[r.n];
+    if (!nv.has(d0) || !nv.has(dn)) { console.log(`  K:${code} 네이버 일봉에 ${d0}/${dn} 없음 — 건너뜀`); continue; }
+    const nvCagr = Math.pow(nv.get(dn) / nv.get(d0), 1 / r.years) - 1;
+    check(`K:${code} 일별 총수익(KRX+분배금) vs 네이버 보정가`, r.cagr, nvCagr, 0.003);
+  }
+
+  // 12) 적립 주기 — 매주·매일도 총투자금이 매월과 거의 같다 (±3%)
+  {
+    const opt = { ...dbase, fxMode: 'krw', initial: 0, monthly: 500000, assets: [dasset('U:QQQ')], start: '2015-01', end: '2024-12' };
+    const m = BT.simulateDaily({ ...opt, freq: 'm', day: 25 });
+    const w = BT.simulateDaily({ ...opt, freq: 'w', wd: 1 });
+    const d = BT.simulateDaily({ ...opt, freq: 'd' });
+    console.log(`  QQQ 적립 매월25일 ${(m.irr * 100).toFixed(2)}% (${m.contribCount}회) · 매주 월 ${(w.irr * 100).toFixed(2)}% (${w.contribCount}회) · 매일 ${(d.irr * 100).toFixed(2)}% (${d.contribCount}회)`);
+    check('매주 총투자금 / 매월', w.invested / m.invested, 1, 0.03);
+    check('매일 총투자금 / 매월', d.invested / m.invested, 1, 1e-9);
+    check('매주 vs 매월 내 돈 기준 차이', w.irr - m.irr, 0, 0.01);
+  }
+
+  // 13) 거치식·재투자 내 돈 기준(XIRR) = 시간가중, 국내+미국 섞어도 계산된다
+  {
+    const r = BT.simulateDaily({ ...dbase, fxMode: 'krw', assets: [dasset('K:069500', 50), dasset('U:SPY', 50)], start: '2016-01', end: '2025-12', rebalance: 12 });
+    check('국내+미국 거치식 XIRR = 시간가중', r.irr, r.cagr, 1e-5);
+    const v = r.perAsset.map(p => p.value), tot = v[0] + v[1];
+    console.log(`  KODEX200+SPY 매년 리밸런싱 연 ${(r.cagr * 100).toFixed(2)}% · MDD ${(r.mdd * 100).toFixed(1)}% (${r.mddAt}) · 마지막 비중 ${(v[0] / tot * 100).toFixed(1)}%`);
+  }
+} else console.log(`\n(일별 데이터 ${DD} 가 없어 일별 검산은 건너뜀)`);
+
 console.log(fail ? `\n실패 ${fail}건` : '\n모두 통과');
 process.exit(fail ? 1 : 0);
