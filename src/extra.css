@@ -60,3 +60,7 @@
     .bt-grid { grid-template-columns: minmax(0, 1fr) 78px 40px; gap: 8px; }
     .bt-grid .holding-del { padding: 8px; }
   }
+
+/* 결과 들고 다음 계산기로 */
+.insight-tools { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.insight-tools .cta-link { cursor: pointer; }
