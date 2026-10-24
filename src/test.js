@@ -189,6 +189,70 @@ if (fs.existsSync(DD)) {
     const v = r.perAsset.map(p => p.value), tot = v[0] + v[1];
     console.log(`  KODEX200+SPY 매년 리밸런싱 연 ${(r.cagr * 100).toFixed(2)}% · MDD ${(r.mdd * 100).toFixed(1)}% (${r.mddAt}) · 마지막 비중 ${(v[0] / tot * 100).toFixed(1)}%`);
   }
+
+  // ── 외부 기준값 (2026-10-24 독립 검증 때 대조한 수치. 지난 기간이라 데이터가 갱신돼도 바뀌지 않는다) ──
+  console.log('\n── 외부 기준값 ──');
+  const usd = new Map([['1990-01-01', 1]]);                    // 달러 그대로 (환율 1 고정)
+  const udaily = { ...base, fx: usd, fxMode: 'fixed', reinvest: true, rebalance: 0, monthly: 0, freq: 'm', day: 'L' };
+
+  // 14) 운용사 공식 연환산 총수익 (2026-09-30, 시장가 기준) — SSGA·Invesco·Schwab 상품 페이지
+  //     운용사는 매수호가·매도호가 중간값·NAV 재투자, 계산기는 종가·배당락일 재투자라 0.1%p 까지 허용
+  const OFFICIAL = { SPY: [15.66, 22.73, 13.66, 15.18], QQQ: [23.84, 28.05, 16.33, 20.90], SCHD: [23.32, 15.45, 9.47, 12.44] };
+  for (const [t, vals] of Object.entries(OFFICIAL)) {
+    [1, 3, 5, 10].forEach((y, i) => {
+      const r = BT.simulateDaily({ ...udaily, initial: 10000, assets: [dasset('U:' + t)], start: `${2026 - y}-09`, end: '2026-09' });
+      check(`${t} ${y}년 연환산 vs 운용사 시장가`, Math.pow(r.twr, 1 / y) - 1, vals[i] / 100, 0.001);
+    });
+  }
+
+  // 15) testfol.io 같은 조건 (2026-10-24 실행) — 연평균·최대 낙폭·바닥 날짜·최종 금액
+  //     testfol 은 시작일 전 마지막 거래일 종가에서 시작, 적립은 다음 달부터 매월 말일(마지막 날 제외)
+  const TESTFOL = [
+    ['SPY 거치 2015~2024', [['SPY', 100]], '2014-12', '2024-12', 0, 13.006, -33.700, '2020-03-23', 33969.65],
+    ['SCHD 거치 2015~2024', [['SCHD', 100]], '2014-12', '2024-12', 0, 11.029, -33.367, '2020-03-23', 28472.32],
+    ['QQQ 거치 2015~2024', [['QQQ', 100]], '2014-12', '2024-12', 0, 18.276, -35.123, '2022-11-03', 53588.62],
+    ['SPY 2020', [['SPY', 100]], '2019-12', '2020-12', 0, 18.332, -33.700, '2020-03-23', 11837.32],
+    ['SCHD50+QQQ50 매년 리밸런싱 2012~2024', [['SCHD', 50], ['QQQ', 50]], '2011-12', '2024-12', 12, 16.551, -30.227, '2020-03-23', 73283.91],
+  ];
+  for (const [label, al, s, e, reb, cagr, mdd, bottom, endVal] of TESTFOL) {
+    const r = BT.simulateDaily({ ...udaily, initial: 10000, rebalance: reb, assets: al.map(([t, w]) => dasset('U:' + t, w)), start: s, end: e });
+    check(`testfol ${label} 연평균`, r.cagr, cagr / 100, 0.0002);
+    check(`testfol ${label} 최대 낙폭`, r.mdd, mdd / 100, 0.0002);
+    check(`testfol ${label} 최종 금액 비율`, r.finalValue / endVal, 1, 0.0005);
+    if (r.mddAt !== bottom) { fail++; console.log(`✗ testfol ${label} 바닥 ${r.mddAt} ≠ ${bottom}`); }
+  }
+  {
+    // 시작 1만 달러 + 매월 500 → 계산기는 시작일에 9,500+500, 마지막 날 500 은 testfol 에 없으므로 뺀다
+    const r = BT.simulateDaily({ ...udaily, initial: 9500, monthly: 500, assets: [dasset('U:SPY')], start: '2014-12', end: '2024-12' });
+    check('testfol SPY 매월 적립 내 돈 기준(MWRR)', r.irr, 0.14126, 0.0002);
+    check('testfol SPY 매월 적립 최종 금액 비율', (r.finalValue - 500) / 161178.85, 1, 0.0005);
+  }
+
+  // 16) 국내 ETF 운용사 발표 (2026-10-23 기준 누적) — 삼성자산운용·미래에셋 상품 페이지·팩트시트
+  //     가격만(시장가격, 분배금 제외)은 정확히 같아야 하고, 분배금 재투자는 운용사가 기준가(NAV) 기준이라 0.5%p 까지
+  const cum = (code, d0, d1) => {
+    const px = dayMap(path.join(DD, 'K', `${code}.csv`)), dv = dayMap(path.join(DD, 'div', 'K', `${code}.csv`));
+    const ds = [...px.keys()].filter(d => d >= d0 && d <= d1).sort();
+    let sh = 1;
+    ds.slice(1).forEach(d => { if (dv.has(d)) sh += sh * dv.get(d) / px.get(d); });
+    const p0 = px.get(ds[0]), p1 = px.get(ds[ds.length - 1]);
+    return { price: p1 / p0 - 1, total: sh * p1 / p0 - 1 };
+  };
+  check('KODEX 200 1년 가격 vs 시장가격', cum('069500', '2025-10-23', '2026-10-23').price, 0.6170, 0.0001);
+  check('KODEX 200 상장 이후 가격 vs 시장가격', cum('069500', '2002-10-14', '2026-10-23').price, 10.2355, 0.0001);
+  check('KODEX 미국S&P500 1년 가격 vs 시장가격', cum('379800', '2025-10-23', '2026-10-23').price, 0.0392, 0.0001);
+  check('KODEX 200 1년 분배금 재투자 vs 기준가', cum('069500', '2025-10-23', '2026-10-23').total, 0.6353, 0.005);
+  check('KODEX 미국S&P500 1년 분배금 재투자 vs 기준가', cum('379800', '2025-10-23', '2026-10-23').total, 0.0617, 0.005);
+  check('TIGER 미국S&P500 3년 vs 팩트시트(2026-09-30)', cum('360750', '2023-09-27', '2026-09-30').total, 0.8481, 0.005);
+  check('TIGER 미국S&P500 1년 vs 팩트시트(2026-09-30)', cum('360750', '2025-09-30', '2026-09-30').total, 0.1196, 0.005);
+
+  // 17) 국내 배당락일 — KRX KIND 공시 (KODEX 200 분배락, 삼성전자 12월) · KRX 6월 배당락 안내 + 기사 (삼성전자 6월)
+  for (const [code, day] of [['069500', '2025-04-29'], ['069500', '2025-10-30'], ['005930', '2024-12-27'], ['005930', '2024-06-27'], ['005930', '2025-06-27']]) {
+    const dv = dayMap(path.join(DD, 'div', 'K', `${code}.csv`));
+    const ok = dv.has(day);
+    if (!ok) fail++;
+    console.log(`${ok ? '✓' : '✗'} ${code} 배당락일 ${day}${ok ? ` (${dv.get(day)}원)` : ' 없음'}`);
+  }
 } else console.log(`\n(일별 데이터 ${DD} 가 없어 일별 검산은 건너뜀)`);
 
 console.log(fail ? `\n실패 ${fail}건` : '\n모두 통과');
